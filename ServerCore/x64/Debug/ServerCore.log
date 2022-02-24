@@ -1,3 +1,2 @@
-﻿  pch.cpp
-  CorePch.cpp
+﻿  DeadLockProfiler.cpp
   ServerCore.vcxproj -> C:\Users\hyoin-netai\Documents\GitHub\chatting-server\Libraries\Debug\ServerCore.lib
