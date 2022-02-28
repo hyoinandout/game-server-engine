@@ -1,1 +1,3 @@
-﻿  GameServer.vcxproj -> C:\Users\hyoin-netai\Documents\GitHub\chatting-server\Binary\Debug\GameServer.exe
+﻿  pch.cpp
+  GameServer.cpp
+  GameServer.vcxproj -> C:\Users\효우\Documents\GitHub\game-server-engine\Binary\Debug\GameServer.exe
