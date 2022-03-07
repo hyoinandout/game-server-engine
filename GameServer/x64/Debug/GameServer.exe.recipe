@@ -2,7 +2,7 @@
 <Project>
   <ProjectOutputs>
     <ProjectOutput>
-      <FullPath>C:\Users\효우\Documents\GitHub\game-server-engine\Binary\Debug\GameServer.exe</FullPath>
+      <FullPath>C:\Users\hyoin-netai\Documents\GitHub\chatting-server\Binary\Debug\GameServer.exe</FullPath>
     </ProjectOutput>
   </ProjectOutputs>
   <ContentFiles />

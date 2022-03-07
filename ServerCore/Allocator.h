@@ -42,11 +42,11 @@ public:
 	T* allocate(size_t count)
 	{
 		const int32 size = static_cast<int32>(count * sizeof(T));
-		return static_cast<T*>(Xalloc(size));
+		return static_cast<T*>(PoolAllocator::Alloc(size));
 	}
 
 	void deallocate(T* ptr, size_t count)
 	{
-		Xrelease(ptr);
+		PoolAllocator::Release(ptr);
 	}
 };
