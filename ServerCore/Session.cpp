@@ -14,20 +14,27 @@ Session::~Session()
 	SocketUtils::Close(_socket);
 }
 
-void Session::Send(BYTE* buffer, int32 len)
+void Session::Send(SendBufferRef sendBuffer)
 {
-	//1. 버퍼 관리
-	//2. sendEvent 관리 : 단일? 여러개? WSASend 중첩?(귓속말 + 몹잡을때...)
+	//최적화 과정 -> send에서 오류나서 코드 많이 타면 뒤에 send가 지체되서, 리팩토링을 한다.(RegisterSend를 lock에서 떼준다(stack 특성이용))
+	if (IsConnected() == false)
+		return;
 
-	//temp : 나중에 broadcast 해야하는데 복사비용이 만만찮다
-	SendEvent* sendEvent = Xnew<SendEvent>();
-	sendEvent->owner = shared_from_this();
-	sendEvent->buffer.resize(len);
-	::memcpy(sendEvent->buffer.data(), buffer, len);
+	bool registerSend = false;
+	
+	{
+		//ProcessSend에서 RegisterSend 걸려있을 거지만 혹시 모르니 한번더 RegisterSend를 걸어준다.
+		WRITE_LOCK;
 
-	//Send is not thread-safe
-	WRITE_LOCK;
-	RegisterSend(sendEvent);
+		_sendQueue.push(sendBuffer);
+
+		//_sendRegistered가 false이면, _sendRegistered를 true로 바꾸고 RegisterSend를 호출한다.
+		if (_sendRegistered.exchange(true) == false)
+			registerSend = true;
+	}
+	
+	if (registerSend)
+		RegisterSend();
 }
 
 bool Session::Connect()
@@ -39,11 +46,8 @@ void Session::Disconnect(const WCHAR* cause)
 {
 	if (_connected.exchange(false) == false)
 		return;
-	//temp
-	wcout << "Disconnect : " << cause << endl;
 
-	OnDisconnected();
-	GetService()->ReleaseSession(GetSessionRef());
+	wcout << "Disconnect : " << cause << endl;
 
 	RegisterDisconnect();
 }
@@ -67,7 +71,7 @@ void Session::Dispatch(IocpEvent* iocpEvent, int32 numOfBytes)
 		ProcessRecv(numOfBytes);
 		break;
 	case EventType::Send:
-		ProcessSend(static_cast<SendEvent*>(iocpEvent), numOfBytes);
+		ProcessSend(numOfBytes);
 		break;
 	default:
 		break;
@@ -151,25 +155,54 @@ void Session::RegisterRecv()
 	}
 }
 
-void Session::RegisterSend(SendEvent* sendEvent)
+void Session::RegisterSend()
 {
 	if (IsConnected() == false)
 		return;
 
-	WSABUF wsaBuf;
-	wsaBuf.buf = (char*)sendEvent->buffer.data();
-	wsaBuf.len = (ULONG)sendEvent->buffer.size();
+	_sendEvent.Init();
+	_sendEvent.owner = shared_from_this(); // ref 추가
+
+	//보낼 데이터를 sendEvent에 등록
+	{
+		WRITE_LOCK;
+
+		int32 writeSize = 0;
+		while (_sendQueue.empty() == false)
+		{
+			SendBufferRef sendBuffer = _sendQueue.front();
+
+			writeSize += sendBuffer->WriteSize();
+			//todo : 예외 체크
+
+			_sendQueue.pop();
+			_sendEvent.sendBuffers.push_back(sendBuffer);
+		}
+	}
+
+	//Scatter - gather (흩어져 있는 데이터 모아 한방에 보내기)
+	Vector<WSABUF> wsaBufs;
+	wsaBufs.reserve(_sendEvent.sendBuffers.size());
+	for (SendBufferRef sendBuffer : _sendEvent.sendBuffers)
+	{
+		WSABUF wsaBuf;
+		wsaBuf.buf = reinterpret_cast<char*>(sendBuffer->Buffer());
+		wsaBuf.len = static_cast<ULONG>(sendBuffer->WriteSize());
+		wsaBufs.push_back(wsaBuf);
+	}
+	
 
 	DWORD numOfBytes = 0;
 	// 중첩되도 괜찮다
-	if (SOCKET_ERROR == ::WSASend(_socket, &wsaBuf, 1, OUT & numOfBytes, 0, sendEvent, nullptr))
+	if (SOCKET_ERROR == ::WSASend(_socket, wsaBufs.data(), static_cast<DWORD>(wsaBufs.size()), OUT & numOfBytes, 0, &_sendEvent, nullptr))
 	{
 		int32 errorCode = ::WSAGetLastError();
 		if (errorCode != WSA_IO_PENDING)
 		{
 			HandleError(errorCode);
-			sendEvent->owner = nullptr;//ref 감소
-			Xdelete(sendEvent);
+			_sendEvent.owner = nullptr;//ref 감소
+			_sendEvent.sendBuffers.clear(); //vector로 send하기 전까지 ref 유지했다가 이제서야 ref 감소
+			_sendRegistered.store(false);
 		}
 	}
 }
@@ -192,6 +225,9 @@ void Session::ProcessConnect()
 void Session::ProcessDisconnect()
 {
 	_disconnectEvent.owner = nullptr;
+
+	OnDisconnected();
+	GetService()->ReleaseSession(GetSessionRef());
 }
 
 void Session::ProcessRecv(int32 numOfBytes)
@@ -224,10 +260,10 @@ void Session::ProcessRecv(int32 numOfBytes)
 	RegisterRecv();
 }
 
-void Session::ProcessSend(SendEvent* sendEvent,int32 numOfBytes)
+void Session::ProcessSend(int32 numOfBytes)
 {
-	sendEvent->owner = nullptr;//ref감소
-	Xdelete(sendEvent);
+	_sendEvent.owner = nullptr;//ref감소
+	_sendEvent.sendBuffers.clear(); //vector로 send하기 전까지 ref 유지했다가 이제서야 ref 감소
 
 	if (numOfBytes == 0)
 	{
@@ -237,6 +273,13 @@ void Session::ProcessSend(SendEvent* sendEvent,int32 numOfBytes)
 
 	//컨텐츠 코드에서 재정의
 	OnSend(numOfBytes);
+
+	//다시 낚싯대 던지기, queue는 멀티쓰레드 환경에서 동시접근 할 수 있으므로 lock 걸어주고
+	WRITE_LOCK;
+	if (_sendQueue.empty())
+		_sendRegistered.store(false);
+	else
+		RegisterSend();
 }
 
 void Session::HandleError(int32 errorCode)
@@ -252,4 +295,41 @@ void Session::HandleError(int32 errorCode)
 		cout << "Handle Error : " << errorCode << endl;
 		break;
 	}
+}
+
+//PacketSession
+PacketSession::PacketSession()
+{
+}
+
+PacketSession::~PacketSession()
+{
+}
+
+//tcp 특성상 패킷이 다 보내진건지 확인이 필요
+//[size(2)][id(2)][data...][size(2)][id(2)][data...]
+int32 PacketSession::OnRecv(BYTE* buffer, int32 len)
+{
+	int32 processLen = 0;
+
+	while (true)
+	{
+		int32 dataSize = len - processLen;
+		//최소한 헤더는 파싱할 수 있어야 함
+		if (dataSize < sizeof(PacketHeader))
+			break;
+
+		PacketHeader header = *(reinterpret_cast<PacketHeader*>(&buffer[processLen]));
+		//헤더에 기록된 패킷 크기 파싱 가능해야함
+		if (dataSize < header.size)
+			break;
+
+		//패킷 조립 성공
+		OnRecvPacket(&buffer[processLen], header.size);
+
+		processLen += header.size;
+	}
+
+	return processLen;
+	return int32();
 }
